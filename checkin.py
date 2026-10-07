@@ -19,6 +19,22 @@ def quota_to_dollar(quota):
         return 0
 
 
+def get_user_info_api(token):
+    """先用 requests 获取用户信息，用于注入浏览器和对比余额"""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    }
+    try:
+        resp = requests.get(f"{BASE_URL}/api/user/self", headers=headers, timeout=15)
+        if resp.status_code == 200 and resp.json().get("success"):
+            return resp.json().get("data", {})
+    except Exception as e:
+        print(f"获取用户信息异常: {e}")
+    return None
+
+
 def send_notification(message):
     print("\n" + "=" * 30)
     print(message)
@@ -47,10 +63,21 @@ def main():
 
     raw_token = AUTH_TOKEN.replace("Bearer ", "").strip()
 
+    # 1. 先验证 Token 并拿到用户数据
+    user_info = get_user_info_api(raw_token)
+    if not user_info:
+        print("❌ Token 无效或已过期，请重新获取 Authorization")
+        sys.exit(1)
+
+    user_id = user_info.get("id")
+    username = user_info.get("username", str(user_id))
+    balance_before = quota_to_dollar(user_info.get("quota", 0))
+    print(f"✅ Token 验证成功 | 账户: {username} | ID: {user_id} | 当前余额: {balance_before}$")
+
     checkin_response_data = {}
 
+    # 2. 启动 Playwright 执行带有 Turnstile 的浏览器模拟
     with sync_playwright() as p:
-        # 启动 Chromium，加入常用反指纹参数
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -63,95 +90,111 @@ def main():
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
+            extra_http_headers={
+                "Authorization": f"Bearer {raw_token}",
+            },
         )
+
+        # 注入会话标记 Cookie
+        context.add_cookies([{
+            "name": "new_api_has_session",
+            "value": "1",
+            "domain": "api.hcnsec.cn",
+            "path": "/",
+        }])
 
         page = context.new_page()
 
-        # 屏蔽 webdriver 特征
+        # 屏蔽 Webdriver 指纹特征
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
             });
         """)
 
-        # 监听签到接口响应
+        # 监听签到响应接口
         def handle_response(response):
             if "/api/user/checkin" in response.url and response.request.method == "POST":
                 try:
                     res_json = response.json()
                     checkin_response_data.update(res_json)
-                    print(f"捕获到签到接口返回: {res_json}")
+                    print(f"📡 捕获到签到接口返回: {res_json}")
                 except Exception:
                     pass
 
         page.on("response", handle_response)
 
-        print("正在打开网站并注入认证凭证...")
-        page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
-
-        # 将 Token 注入到 LocalStorage
-        page.evaluate(f"""() => {{
+        # 注入 LocalStorage（New-API 前端需要 user 对象）
+        user_json_str = json.dumps(user_info).replace("'", "\\'")
+        page.add_init_script(f"""
+            localStorage.setItem('user', '{user_json_str}');
             localStorage.setItem('token', '{raw_token}');
-        }}""")
+        """)
 
-        # 访问个人主页
-        page.goto(f"{BASE_URL}/profile", wait_until="networkidle")
-        time.sleep(3)
+        print("正在打开个人中心页面...")
+        # 此处使用 domcontentloaded，避免因后台持续网络连接导致超时
+        page.goto(f"{BASE_URL}/profile", wait_until="domcontentloaded", timeout=60000)
 
-        # 检查是否成功加载个人中心
-        if "profile" not in page.url and "login" in page.url:
-            print("❌ 页面被重定向回登录页，Token 可能已失效")
-            browser.close()
-            sys.exit(1)
+        # 等待页面组件及 Turnstile 渲染
+        print("等待页面元素及人机验证加载...")
+        time.sleep(4)
 
-        print("✅ 成功进入个人中心，等待 Turnstile 人机验证就绪...")
-        # 等待 Turnstile 自动渲染和静默校验
-        time.sleep(5)
-
-        # 寻找并点击【立即签到】按钮
+        # 寻找签到按钮
         btn = page.locator("button:has-text('立即签到'), button:has-text('签到')").first
-        if btn.is_visible():
-            print("找到签到按钮，正在点击...")
-            btn.click()
-            # 点击后等待网络响应和 Turnstile 提交
-            page.wait_for_timeout(6000)
-        else:
-            print("⚠️ 未找到签到按钮，可能今日已完成签到或按钮文案不匹配")
+        try:
+            if btn.is_visible(timeout=5000):
+                print("🎯 找到「立即签到」按钮，正在点击...")
+                btn.click()
+                # 点击后等待 6 秒供 Turnstile 计算并通过接口提交
+                page.wait_for_timeout(6000)
+            else:
+                print("ℹ️ 未检测到「立即签到」按钮（可能今日已完成签到）")
+        except Exception as e:
+            print(f"查找或点击签到按钮时提示: {e}")
 
         browser.close()
 
-    # 处理通知逻辑
+    # 3. 重新获取一次余额计算增量
+    time.sleep(1)
+    new_info = get_user_info_api(raw_token)
+    balance_after = quota_to_dollar(new_info.get("quota", 0)) if new_info else balance_before
+
+    # 4. 组装结果通知
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
     success = checkin_response_data.get("success", False)
     msg = str(checkin_response_data.get("message", ""))
 
-    if success:
-        awarded_data = checkin_response_data.get("data", {})
-        awarded_quota = awarded_data.get("quota_awarded", 0)
-        awarded_dollar = quota_to_dollar(awarded_quota)
+    if success or (balance_after > balance_before):
+        awarded_dollar = balance_after - balance_before
         message = (
             f"🎁 签到通知\n\n"
-            f"✅ 签到成功！本次获得: {awarded_dollar}$\n"
+            f"✅ 签到成功！\n"
+            f"👤 账户: {username}\n"
+            f"💰 变动: +{awarded_dollar}$ (当前: {balance_after}$)\n"
             f"⏱️ 签到时间: {now}"
         )
     elif any(k in msg for k in ["已签到", "重复签到", "今天已签到"]):
         message = (
             f"🎁 签到通知\n\n"
             f"✅ 今日你已经签到过了！\n"
+            f"👤 账户: {username}\n"
+            f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
     elif msg:
         message = (
             f"🎁 签到通知\n\n"
             f"❌ 签到失败: {msg}\n"
+            f"👤 账户: {username}\n"
+            f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
     else:
         message = (
             f"🎁 签到通知\n\n"
-            f"ℹ️ 脚本执行完成（未截获到新签到响应，可能已完成签到）\n"
+            f"ℹ️ 执行完毕（未截获到新签到响应，当前余额: {balance_after}$）\n"
             f"⏱️ 执行时间: {now}"
         )
 
