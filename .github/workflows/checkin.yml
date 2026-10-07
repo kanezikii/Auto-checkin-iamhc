@@ -27,9 +27,7 @@ jobs:
 
       - name: Run checkin
         env:
-          COOKIE: ${{ secrets.COOKIE }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin.py
