@@ -20,7 +20,7 @@ def quota_to_dollar(quota):
 
 
 def get_user_info_api(token):
-    """先用 requests 获取用户信息，用于注入浏览器和对比余额"""
+    """通过 API 获取用户信息"""
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Authorization": f"Bearer {token}",
@@ -63,11 +63,15 @@ def main():
 
     raw_token = AUTH_TOKEN.replace("Bearer ", "").strip()
 
-    # 1. 先验证 Token 并拿到用户数据
+    # 1. 获取基本信息并补充 token 字段
     user_info = get_user_info_api(raw_token)
     if not user_info:
         print("❌ Token 无效或已过期，请重新获取 Authorization")
         sys.exit(1)
+
+    # 关键修复：补全前端判断登录状态所需的 token 字段
+    user_info["token"] = raw_token
+    user_info["access_token"] = raw_token
 
     user_id = user_info.get("id")
     username = user_info.get("username", str(user_id))
@@ -76,7 +80,6 @@ def main():
 
     checkin_response_data = {}
 
-    # 2. 启动 Playwright 执行带有 Turnstile 的浏览器模拟
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -89,13 +92,12 @@ def main():
 
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1440, "height": 900},
             extra_http_headers={
                 "Authorization": f"Bearer {raw_token}",
             },
         )
 
-        # 注入会话标记 Cookie
         context.add_cookies([{
             "name": "new_api_has_session",
             "value": "1",
@@ -112,7 +114,7 @@ def main():
             });
         """)
 
-        # 监听签到响应接口
+        # 监听签到响应
         def handle_response(response):
             if "/api/user/checkin" in response.url and response.request.method == "POST":
                 try:
@@ -124,37 +126,37 @@ def main():
 
         page.on("response", handle_response)
 
-        # 注入 LocalStorage（New-API 前端需要 user 对象）
-        user_json_str = json.dumps(user_info).replace("'", "\\'")
+        # 注入 LocalStorage 与 SessionStorage
+        user_json = json.dumps(user_info)
         page.add_init_script(f"""
-            localStorage.setItem('user', '{user_json_str}');
-            localStorage.setItem('token', '{raw_token}');
+            window.localStorage.setItem('user', JSON.stringify({user_json}));
+            window.localStorage.setItem('token', '{raw_token}');
+            window.sessionStorage.setItem('user', JSON.stringify({user_json}));
+            window.sessionStorage.setItem('token', '{raw_token}');
         """)
 
         print("正在打开个人中心页面...")
-        # 此处使用 domcontentloaded，避免因后台持续网络连接导致超时
         page.goto(f"{BASE_URL}/profile", wait_until="domcontentloaded", timeout=60000)
 
-        # 等待页面组件及 Turnstile 渲染
-        print("等待页面元素及人机验证加载...")
-        time.sleep(4)
+        # 等待页面加载并输出当前实际地址用于排查
+        time.sleep(3)
+        print(f"当前页面实际地址: {page.url}")
 
-        # 寻找签到按钮
-        btn = page.locator("button:has-text('立即签到'), button:has-text('签到')").first
+        # 使用文本穿透定位按钮，并设置显式等待
+        btn = page.locator("text='立即签到'").first
         try:
-            if btn.is_visible(timeout=5000):
-                print("🎯 找到「立即签到」按钮，正在点击...")
-                btn.click()
-                # 点击后等待 6 秒供 Turnstile 计算并通过接口提交
-                page.wait_for_timeout(6000)
-            else:
-                print("ℹ️ 未检测到「立即签到」按钮（可能今日已完成签到）")
+            print("正在等待「立即签到」按钮渲染就绪...")
+            btn.wait_for(state="visible", timeout=15000)
+            print("🎯 定位成功，正在执行点击...")
+            btn.click()
+            print("已点击，等待 Turnstile 静默完成并提交...")
+            page.wait_for_timeout(8000)
         except Exception as e:
-            print(f"查找或点击签到按钮时提示: {e}")
+            print(f"ℹ️ 点击未完成（可能已签到或渲染超时）: {e}")
 
         browser.close()
 
-    # 3. 重新获取一次余额计算增量
+    # 3. 再次获取余额比对增量
     time.sleep(1)
     new_info = get_user_info_api(raw_token)
     balance_after = quota_to_dollar(new_info.get("quota", 0)) if new_info else balance_before
@@ -194,7 +196,7 @@ def main():
     else:
         message = (
             f"🎁 签到通知\n\n"
-            f"ℹ️ 执行完毕（未截获到新签到响应，当前余额: {balance_after}$）\n"
+            f"ℹ️ 执行完毕（当前余额: {balance_after}$）\n"
             f"⏱️ 执行时间: {now}"
         )
 
