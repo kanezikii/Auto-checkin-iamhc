@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,sys,time,requests
+import os, sys, time, requests
 from datetime import datetime
 from urllib.parse import quote
 
+COOKIE        = os.environ.get("COOKIE") or ""
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
-BASE_URL      = "https://api.hcnsec.cn"
-QUOTA_PER_UNIT = 500000 # new-api 默认额度换算比例：500000 quota = 1$
-TURNSTILE_TOKEN = ""    # 该站点暂未开启 turuntile,暂时用不上此参数
+BASE_URL       = "https://api.hcnsec.cn"
+QUOTA_PER_UNIT = 500000  # new-api 默认额度换算比例：500000 quota = 1$
+TURNSTILE_TOKEN = ""
 
 def login(session: requests.Session):
-    """登录并返回用户信息（id + username）。"""
+    """账号密码登录并返回用户信息"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
-
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/login",
     }
-
     resp = session.post(
         login_url,
         headers=headers,
         json={"username": EMAIL, "password": PASSWORD},
         timeout=20,
     )
-
     if resp.status_code != 200:
         print("登录请求失败:", resp.status_code)
         return None
@@ -53,43 +51,45 @@ def login(session: requests.Session):
     return {"id": user_id, "username": username}
 
 
-def get_user_info(session: requests.Session, user_id):
-    """获取用户信息，返回 data 字典（包含 quota 等字段）。"""
+def get_user_info(session: requests.Session, user_id=None):
+    """获取用户信息，返回 data 字典"""
     url = f"{BASE_URL}/api/user/self"
-
     headers = {
         "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
     }
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
 
     resp = session.get(url, headers=headers, timeout=20)
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("success"):
+            return data.get("data", {})
     return None
 
 
 def checkin(session: requests.Session, user_id):
-    """执行签到，返回签到响应的完整 JSON。"""
+    """执行签到"""
     url = f"{BASE_URL}/api/user/checkin"
-
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": BASE_URL,
         "Referer": BASE_URL,
         "New-Api-User": str(user_id),
     }
-
     resp = session.post(url, headers=headers, json={}, timeout=20)
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        return {"success": False, "message": f"状态码: {resp.status_code}"}
 
 
 def quota_to_dollar(quota):
-    """将内部 quota 值转换为美元金额（整数）。"""
+    """额度换算"""
     return round(quota / QUOTA_PER_UNIT)
 
 
@@ -112,82 +112,82 @@ def send_notification(message):
                 print(f"Telegram 通知发送失败: {resp.status_code} {resp.text}")
         except Exception as e:
             print("Telegram 通知发送失败:", e)
-    else:
-        print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 Telegram 推送")
 
 
 def main():
-    if not EMAIL or not PASSWORD:
-        print("请先设置 EMAIL 和 PASSWORD 环境变量（或在脚本中填写默认值）")
-        sys.exit(1)
-
     session = requests.Session()
 
-    # 登录
-    user = login(session)
-    if not user:
-        print("\n登录失败，无法继续签到")
-        sys.exit(1)
+    user_id = None
+    username = None
 
-    user_id = user["id"]
-    username = user.get("username", str(user_id))
+    if COOKIE:
+        # 优先使用 Cookie 登录
+        session.headers.update({"Cookie": COOKIE})
+        info_before = get_user_info(session)
+        if not info_before:
+            print("❌ Cookie 无效或已过期，请重新获取 Cookie 并更新 GitHub Secrets")
+            sys.exit(1)
+        user_id = info_before.get("id")
+        username = info_before.get("username", str(user_id))
+        print(f"✅ Cookie 校验成功 | 账户: {username} | ID: {user_id}")
+    else:
+        # 未配置 COOKIE 时走密码登录
+        if not EMAIL or not PASSWORD:
+            print("❌ 未检测到 COOKIE，且未配置完整的 EMAIL / PASSWORD")
+            sys.exit(1)
+        user = login(session)
+        if not user:
+            print("\n❌ 登录失败。该站点已开启 Turnstile 验证码，请在 Secrets 中配置 COOKIE 绕过登录。")
+            sys.exit(1)
+        user_id = user["id"]
+        username = user.get("username", str(user_id))
+        info_before = get_user_info(session, user_id)
+        if not info_before:
+            print("❌ 获取用户信息失败")
+            sys.exit(1)
 
-    # 获取签到前余额
-    info_before = get_user_info(session, user_id)
-    if not info_before:
-        print("获取用户信息失败")
-        sys.exit(1)
     balance_before = quota_to_dollar(info_before.get("quota", 0))
 
-    # 签到
+    # 执行签到
     checkin_data = checkin(session, user_id)
 
-    # 获取签到后余额
+    # 签到后刷新余额
     info_after = get_user_info(session, user_id)
-    if not info_after:
-        print("获取签到后用户信息失败")
-        sys.exit(1)
-    balance_after = quota_to_dollar(info_after.get("quota", 0))
+    balance_after = quota_to_dollar(info_after.get("quota", 0)) if info_after else balance_before
 
-    # 判断签到结果
+    # 状态处理与消息格式化
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     success = checkin_data.get("success", False)
     msg = str(checkin_data.get("message", ""))
 
     if success:
-        # 签到成功
         awarded_data = checkin_data.get("data", {})
         awarded_quota = awarded_data.get("quota_awarded", 0)
         awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
         print(f"✅ 签到成功 | 获得: {awarded_dollar}$")
 
         message = (
-            f"🎁 iamhc 签到通知\n\n"
-            f"✅ 签到成功,本次签到获得{awarded_dollar}$\n"
+            f"🎁 签到通知\n\n"
+            f"✅ 签到成功, 本次签到获得: {awarded_dollar}$\n"
             f"👤 登录账户: {username}\n"
             f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
-    elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
-        # 今日已签到
+    elif any(k in msg for k in ["已签到", "重复签到", "今天已签到"]):
         print(f"✅ 今日已签到 | 当前余额: {balance_after}$")
-
         message = (
-            f"🎁 iamhc 签到通知\n\n"
+            f"🎁 签到通知\n\n"
             f"✅ 今日你已经签到过了！\n"
             f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
             f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
     else:
-        # 签到失败
         print(f"❌ 签到失败 | {msg}")
-
         message = (
-            f"🎁 iamhc 签到通知\n\n"
+            f"🎁 签到通知\n\n"
             f"❌ 签到失败: {msg}\n"
             f"👤 登录账户: {username}\n"
             f"💰 昨日余额: {balance_before}$\n"
@@ -195,7 +195,6 @@ def main():
             f"⏱️ 签到时间: {now}"
         )
 
-    # 发送通知
     send_notification(message)
 
 
