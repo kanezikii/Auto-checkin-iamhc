@@ -1,69 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, requests
-from datetime import datetime
+import os, sys, time, json, requests
+from playwright.sync_api import sync_playwright
 
-# 从环境变量获取 Token（优先）或账号密码
-AUTH_TOKEN    = os.environ.get("AUTH_TOKEN") or ""
-EMAIL         = os.environ.get("EMAIL") or ""
-PASSWORD      = os.environ.get("PASSWORD") or ""
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
+AUTH_TOKEN   = os.environ.get("AUTH_TOKEN") or ""
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL       = "https://api.hcnsec.cn"
-QUOTA_PER_UNIT = 500000  # 额度换算比例
-
-# 确保 Authorization 格式正确
-if AUTH_TOKEN and not AUTH_TOKEN.startswith("Bearer "):
-    AUTH_TOKEN = f"Bearer {AUTH_TOKEN}"
-
-
-def get_user_info(session: requests.Session):
-    """获取用户信息"""
-    url = f"{BASE_URL}/api/user/self"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Authorization": AUTH_TOKEN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": f"{BASE_URL}/profile",
-    }
-    resp = session.get(url, headers=headers, timeout=20)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("success"):
-            return data.get("data", {})
-    return None
-
-
-def checkin(session: requests.Session, user_id):
-    """执行签到"""
-    url = f"{BASE_URL}/api/user/checkin"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Authorization": AUTH_TOKEN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/profile",
-        "New-Api-User": str(user_id),
-    }
-    resp = session.post(url, headers=headers, json={}, timeout=20)
-    try:
-        return resp.json()
-    except Exception:
-        return {"success": False, "message": f"状态码: {resp.status_code}"}
+QUOTA_PER_UNIT = 500000  # 额度比例：500000 quota = 1$
 
 
 def quota_to_dollar(quota):
-    """额度换算"""
-    return round(quota / QUOTA_PER_UNIT)
+    try:
+        return round(float(quota) / QUOTA_PER_UNIT)
+    except Exception:
+        return 0
 
 
 def send_notification(message):
-    print("\n" + "=" * 25)
+    print("\n" + "=" * 30)
     print(message)
-    print("=" * 25)
+    print("=" * 30)
 
     if TG_BOT_TOKEN and TG_CHAT_ID:
         try:
@@ -83,67 +42,117 @@ def send_notification(message):
 
 def main():
     if not AUTH_TOKEN:
-        print("❌ 未配置 AUTH_TOKEN，请在 GitHub Secrets 中配置 AUTH_TOKEN")
+        print("❌ 未配置 AUTH_TOKEN")
         sys.exit(1)
 
-    session = requests.Session()
+    raw_token = AUTH_TOKEN.replace("Bearer ", "").strip()
 
-    # 1. 验证 Token 并获取用户信息
-    info_before = get_user_info(session)
-    if not info_before:
-        print("❌ Token 无效或已过期，请重新从浏览器获取 Authorization 填入 Secrets")
-        sys.exit(1)
+    checkin_response_data = {}
 
-    user_id = info_before.get("id")
-    username = info_before.get("username", str(user_id))
-    balance_before = quota_to_dollar(info_before.get("quota", 0))
-    print(f"✅ Token 验证成功 | 账户: {username} | ID: {user_id} | 当前余额: {balance_before}$")
+    with sync_playwright() as p:
+        # 启动 Chromium，加入常用反指纹参数
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
 
-    # 2. 执行签到
-    checkin_data = checkin(session, user_id)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
 
-    # 3. 签到后刷新余额
-    info_after = get_user_info(session)
-    balance_after = quota_to_dollar(info_after.get("quota", 0)) if info_after else balance_before
+        page = context.new_page()
 
-    # 4. 判断结果
+        # 屏蔽 webdriver 特征
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        # 监听签到接口响应
+        def handle_response(response):
+            if "/api/user/checkin" in response.url and response.request.method == "POST":
+                try:
+                    res_json = response.json()
+                    checkin_response_data.update(res_json)
+                    print(f"捕获到签到接口返回: {res_json}")
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
+        print("正在打开网站并注入认证凭证...")
+        page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
+
+        # 将 Token 注入到 LocalStorage
+        page.evaluate(f"""() => {{
+            localStorage.setItem('token', '{raw_token}');
+        }}""")
+
+        # 访问个人主页
+        page.goto(f"{BASE_URL}/profile", wait_until="networkidle")
+        time.sleep(3)
+
+        # 检查是否成功加载个人中心
+        if "profile" not in page.url and "login" in page.url:
+            print("❌ 页面被重定向回登录页，Token 可能已失效")
+            browser.close()
+            sys.exit(1)
+
+        print("✅ 成功进入个人中心，等待 Turnstile 人机验证就绪...")
+        # 等待 Turnstile 自动渲染和静默校验
+        time.sleep(5)
+
+        # 寻找并点击【立即签到】按钮
+        btn = page.locator("button:has-text('立即签到'), button:has-text('签到')").first
+        if btn.is_visible():
+            print("找到签到按钮，正在点击...")
+            btn.click()
+            # 点击后等待网络响应和 Turnstile 提交
+            page.wait_for_timeout(6000)
+        else:
+            print("⚠️ 未找到签到按钮，可能今日已完成签到或按钮文案不匹配")
+
+        browser.close()
+
+    # 处理通知逻辑
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    success = checkin_data.get("success", False)
-    msg = str(checkin_data.get("message", ""))
+
+    success = checkin_response_data.get("success", False)
+    msg = str(checkin_response_data.get("message", ""))
 
     if success:
-        awarded_data = checkin_data.get("data", {})
+        awarded_data = checkin_response_data.get("data", {})
         awarded_quota = awarded_data.get("quota_awarded", 0)
-        awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
-        print(f"✅ 签到成功 | 获得: {awarded_dollar}$")
-
+        awarded_dollar = quota_to_dollar(awarded_quota)
         message = (
             f"🎁 签到通知\n\n"
-            f"✅ 签到成功, 本次签到获得: {awarded_dollar}$\n"
-            f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
-            f"💰 当前余额: {balance_after}$\n"
+            f"✅ 签到成功！本次获得: {awarded_dollar}$\n"
             f"⏱️ 签到时间: {now}"
         )
     elif any(k in msg for k in ["已签到", "重复签到", "今天已签到"]):
-        print(f"✅ 今日已签到 | 当前余额: {balance_after}$")
         message = (
             f"🎁 签到通知\n\n"
             f"✅ 今日你已经签到过了！\n"
-            f"👤 登录账户: {username}\n"
-            f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
         )
-    else:
-        print(f"❌ 签到失败 | {msg}")
+    elif msg:
         message = (
             f"🎁 签到通知\n\n"
             f"❌ 签到失败: {msg}\n"
-            f"👤 登录账户: {username}\n"
-            f"💰 昨日余额: {balance_before}$\n"
-            f"💰 当前余额: {balance_after}$\n"
             f"⏱️ 签到时间: {now}"
+        )
+    else:
+        message = (
+            f"🎁 签到通知\n\n"
+            f"ℹ️ 脚本执行完成（未截获到新签到响应，可能已完成签到）\n"
+            f"⏱️ 执行时间: {now}"
         )
 
     send_notification(message)
