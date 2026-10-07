@@ -3,65 +3,31 @@
 
 import os, sys, time, requests
 from datetime import datetime
-from urllib.parse import quote
 
-COOKIE        = os.environ.get("COOKIE") or ""
+# 从环境变量获取 Token（优先）或账号密码
+AUTH_TOKEN    = os.environ.get("AUTH_TOKEN") or ""
 EMAIL         = os.environ.get("EMAIL") or ""
 PASSWORD      = os.environ.get("PASSWORD") or ""
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL       = "https://api.hcnsec.cn"
-QUOTA_PER_UNIT = 500000  # new-api 默认额度换算比例：500000 quota = 1$
-TURNSTILE_TOKEN = ""
+QUOTA_PER_UNIT = 500000  # 额度换算比例
 
-def login(session: requests.Session):
-    """账号密码登录并返回用户信息"""
-    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/login",
-    }
-    resp = session.post(
-        login_url,
-        headers=headers,
-        json={"username": EMAIL, "password": PASSWORD},
-        timeout=20,
-    )
-    if resp.status_code != 200:
-        print("登录请求失败:", resp.status_code)
-        return None
-
-    data = resp.json()
-    if not data.get("success"):
-        print("登录失败:", data.get("message", ""))
-        return None
-
-    user_data = data.get("data", {})
-    user_id = user_data.get("id")
-    username = user_data.get("username", "")
-    if not user_id:
-        print("登录成功但未获取到用户 ID")
-        return None
-
-    print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username}
+# 确保 Authorization 格式正确
+if AUTH_TOKEN and not AUTH_TOKEN.startswith("Bearer "):
+    AUTH_TOKEN = f"Bearer {AUTH_TOKEN}"
 
 
-def get_user_info(session: requests.Session, user_id=None):
-    """获取用户信息，返回 data 字典"""
+def get_user_info(session: requests.Session):
+    """获取用户信息"""
     url = f"{BASE_URL}/api/user/self"
     headers = {
         "Accept": "application/json, text/plain, */*",
+        "Authorization": AUTH_TOKEN,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": BASE_URL,
+        "Referer": f"{BASE_URL}/profile",
     }
-    if user_id:
-        headers["New-Api-User"] = str(user_id)
-
     resp = session.get(url, headers=headers, timeout=20)
     if resp.status_code == 200:
         data = resp.json()
@@ -76,9 +42,10 @@ def checkin(session: requests.Session, user_id):
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
+        "Authorization": AUTH_TOKEN,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": BASE_URL,
-        "Referer": BASE_URL,
+        "Referer": f"{BASE_URL}/profile",
         "New-Api-User": str(user_id),
     }
     resp = session.post(url, headers=headers, json={}, timeout=20)
@@ -115,47 +82,31 @@ def send_notification(message):
 
 
 def main():
+    if not AUTH_TOKEN:
+        print("❌ 未配置 AUTH_TOKEN，请在 GitHub Secrets 中配置 AUTH_TOKEN")
+        sys.exit(1)
+
     session = requests.Session()
 
-    user_id = None
-    username = None
+    # 1. 验证 Token 并获取用户信息
+    info_before = get_user_info(session)
+    if not info_before:
+        print("❌ Token 无效或已过期，请重新从浏览器获取 Authorization 填入 Secrets")
+        sys.exit(1)
 
-    if COOKIE:
-        # 优先使用 Cookie 登录
-        session.headers.update({"Cookie": COOKIE})
-        info_before = get_user_info(session)
-        if not info_before:
-            print("❌ Cookie 无效或已过期，请重新获取 Cookie 并更新 GitHub Secrets")
-            sys.exit(1)
-        user_id = info_before.get("id")
-        username = info_before.get("username", str(user_id))
-        print(f"✅ Cookie 校验成功 | 账户: {username} | ID: {user_id}")
-    else:
-        # 未配置 COOKIE 时走密码登录
-        if not EMAIL or not PASSWORD:
-            print("❌ 未检测到 COOKIE，且未配置完整的 EMAIL / PASSWORD")
-            sys.exit(1)
-        user = login(session)
-        if not user:
-            print("\n❌ 登录失败。该站点已开启 Turnstile 验证码，请在 Secrets 中配置 COOKIE 绕过登录。")
-            sys.exit(1)
-        user_id = user["id"]
-        username = user.get("username", str(user_id))
-        info_before = get_user_info(session, user_id)
-        if not info_before:
-            print("❌ 获取用户信息失败")
-            sys.exit(1)
-
+    user_id = info_before.get("id")
+    username = info_before.get("username", str(user_id))
     balance_before = quota_to_dollar(info_before.get("quota", 0))
+    print(f"✅ Token 验证成功 | 账户: {username} | ID: {user_id} | 当前余额: {balance_before}$")
 
-    # 执行签到
+    # 2. 执行签到
     checkin_data = checkin(session, user_id)
 
-    # 签到后刷新余额
-    info_after = get_user_info(session, user_id)
+    # 3. 签到后刷新余额
+    info_after = get_user_info(session)
     balance_after = quota_to_dollar(info_after.get("quota", 0)) if info_after else balance_before
 
-    # 状态处理与消息格式化
+    # 4. 判断结果
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     success = checkin_data.get("success", False)
